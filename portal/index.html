@@ -67,6 +67,9 @@
   #pending-list form { margin-top: 1rem; padding-top: .65rem; border-top: 1px solid var(--line); }
   .orders-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 215px), 1fr)); gap: 0 1rem; }
   .order-list { margin: .85rem 0 0; padding: 0; list-style: none; }
+  .order-lab-controls { display: flex; align-items: end; flex-wrap: wrap; gap: .5rem 1rem; margin-top: .75rem; }
+  .order-lab-controls label { flex: 1 1 13rem; }
+  .order-lab-controls button { width: auto; margin: 0; }
   .order-list li { padding: .75rem .85rem; margin-top: .5rem; border-left: 3px solid var(--teal); border-radius: .35rem; background: #edf6f8; overflow-wrap: anywhere; }
   .portal:has(#logout:not([hidden])) { grid-template-columns: minmax(11rem, 19rem) minmax(0, 1fr); }
   .portal:has(#logout:not([hidden])) .brand-panel { align-items: start; padding: 1.6rem; }
@@ -132,6 +135,11 @@
     <p id="admin-status" role="status"></p>
     <div id="pending-list"></div>
   </section>
+  <section id="saved-order-summary" class="panel lab-order-summary" hidden>
+    <h2>Órdenes guardadas</h2>
+    <p id="saved-order-count" role="status"></p>
+    <button id="view-saved-orders" class="secondary" type="button">Ver órdenes guardadas</button>
+  </section>
   <section id="orders-area" hidden>
     <h2>Órdenes de trabajo</h2>
     <form id="order-form" hidden>
@@ -140,11 +148,21 @@
         <div><label for="patient">Referencia ficticia del paciente</label><input id="patient" name="patient" maxlength="80" placeholder="Ej. PAC-QA-001" required></div>
       </div>
       <label for="service">Servicio solicitado</label><input id="service" name="service" maxlength="120" required>
+      <div id="order-lab-field" hidden><label for="order-lab">Laboratorio responsable</label>
+        <select id="order-lab" name="responsible_lab" disabled></select>
+      </div>
       <label for="observations">Observaciones</label><textarea id="observations" name="observations" rows="3" maxlength="1000"></textarea>
       <button type="submit">Guardar orden</button>
     </form>
     <p id="orders-status" role="status"></p>
+    <label id="order-filter-label" for="order-lab-filter">Filtrar por laboratorio</label>
+    <select id="order-lab-filter" aria-labelledby="order-filter-label"></select>
+    <p id="order-list-status" role="status"></p>
     <ul id="order-list" class="order-list"></ul>
+    <div class="order-lab-controls" id="saved-order-pages" hidden>
+      <button id="orders-previous" type="button">Anterior</button>
+      <button id="orders-next" type="button">Siguiente</button>
+    </div>
   </section>
   <footer class="utility"><p>Entorno de pruebas. Usa únicamente datos ficticios.</p><a href="./diseno.html">Ver diseño de referencia</a></footer>
   </main>
@@ -301,31 +319,174 @@ const orderList = document.querySelector('#order-list');
 const clinicInput = orderForm.elements.clinic;
 const clinicSelect = document.querySelector('#clinic-options');
 const orderSubmit = orderForm.querySelector('button');
+const orderLabField = document.querySelector('#order-lab-field');
+const orderLab = orderForm.elements.responsible_lab;
+const orderLabFilter = document.querySelector('#order-lab-filter');
+const orderLabFilterLabel = document.querySelector('#order-filter-label');
+const orderListStatus = document.querySelector('#order-list-status');
+const laboratoryNames = new Map([
+  ['smile_esthetic', 'Smile Esthetic'],
+  ['jk_ceramic_lab', 'J & K Ceramic Lab'],
+]);
+const labOptions = () => [...laboratoryNames].map(([code, name]) => new Option(name, code));
+orderLab.replaceChildren(new Option('Selecciona un laboratorio', ''), ...labOptions());
+orderLabFilter.replaceChildren(new Option('Todos los laboratorios', ''), ...labOptions(), new Option('Sin asignar', 'unassigned'));
+const savedSummary = document.querySelector('#saved-order-summary');
+const savedCount = document.querySelector('#saved-order-count');
+const savedPages = document.querySelector('#saved-order-pages');
+const previousPage = document.querySelector('#orders-previous');
+const nextPage = document.querySelector('#orders-next');
+const pageSize = 50;
+let ordersOffset = 0;
+let orderLoadVersion = 0;
+let canAssignLab = false;
 
-async function requestData(path, options = {}) {
+async function requestData(path, options = {}, includeCount = false) {
   const response = await fetch(endpoint + '/rest/v1/' + path, {
     ...options,
     headers: { apikey, Authorization: 'Bearer ' + token, ...options.headers }
   });
   if (!response.ok) throw new Error('Request failed');
+  if (includeCount) {
+    const total = response.headers.get('content-range')?.split('/').at(-1);
+    return { records: await response.json(), count: total && total !== '*' ? Number(total) : null };
+  }
   return response.status === 204 ? null : response.json();
 }
 
-async function loadOrders() {
-  const orders = await requestData('lab_orders?select=id,clinic_code,patient_reference,service,status,created_at&order=created_at.desc&limit=100');
-  orderList.replaceChildren(...orders.map(order => {
-    const item = document.createElement('li');
-    const time = new Intl.DateTimeFormat('es-CO', { dateStyle: 'short', timeStyle: 'short', timeZone: 'America/Bogota' }).format(new Date(order.created_at));
-    item.textContent = [order.id.slice(0, 8).toUpperCase(), order.service, order.clinic_code, order.patient_reference, order.status, time].join(' · ');
-    return item;
-  }));
-  orderStatus.textContent = orders.length ? '' : 'No hay órdenes disponibles para esta cuenta.';
+function renderOrder(order) {
+  const item = document.createElement('li');
+  const time = new Intl.DateTimeFormat('es-CO', { dateStyle: 'short', timeStyle: 'short', timeZone: 'America/Bogota' }).format(new Date(order.created_at));
+  const reference = order.id.slice(0, 8).toUpperCase();
+  const currentLab = laboratoryNames.get(order.responsible_lab) || 'Sin asignar';
+  const details = document.createElement('div');
+  details.textContent = [reference, order.service, order.clinic_code, order.patient_reference, order.status, time].join(' · ');
+  const lab = document.createElement('strong');
+  lab.textContent = 'Laboratorio: ' + currentLab;
+  item.append(details, lab);
+
+  if (canAssignLab) {
+    const controls = document.createElement('div');
+    controls.className = 'order-lab-controls';
+    const label = document.createElement('label');
+    label.textContent = 'Cambiar laboratorio de la orden ' + reference;
+    const select = document.createElement('select');
+    if (!order.responsible_lab) select.append(new Option('Selecciona un laboratorio', ''));
+    select.append(...labOptions());
+    select.value = order.responsible_lab || '';
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.textContent = 'Guardar asignación';
+    save.disabled = true;
+    const feedback = document.createElement('p');
+    feedback.setAttribute('role', 'status');
+    label.append(select);
+    controls.append(label, save);
+    item.append(controls, feedback);
+    select.addEventListener('change', () => { save.disabled = !select.value || select.value === order.responsible_lab; });
+    save.addEventListener('click', async () => {
+      if (!token || save.disabled || !laboratoryNames.has(select.value)) return;
+      const next = select.value;
+      save.disabled = true;
+      select.disabled = true;
+      feedback.textContent = '';
+      const expected = order.responsible_lab ? 'eq.' + order.responsible_lab : 'is.null';
+      try {
+        const updated = await requestData('lab_orders?id=eq.' + encodeURIComponent(order.id) + '&responsible_lab=' + expected + '&select=id', {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+          body: JSON.stringify({ responsible_lab: next })
+        });
+        if (!token) return;
+        const message = updated.length
+          ? 'Orden ' + reference + ' asignada a ' + laboratoryNames.get(next) + '.'
+          : 'La orden cambió. Se actualizó la lista para que puedas revisar su asignación.';
+        if (updated.length) {
+          order.responsible_lab = next;
+          lab.textContent = 'Laboratorio: ' + laboratoryNames.get(next);
+        }
+        await loadOrders();
+        orderStatus.textContent = message;
+      } catch {
+        feedback.textContent = 'No se pudo actualizar la lista. Revisa la asignación e intenta nuevamente.';
+        if (!item.isConnected) orderStatus.textContent = feedback.textContent;
+      } finally {
+        select.disabled = false;
+        save.disabled = select.value === order.responsible_lab;
+      }
+    });
+  }
+  return item;
 }
+
+async function loadOrders() {
+  const requestVersion = ++orderLoadVersion;
+  const filter = orderLabFilter.value;
+  const query = new URLSearchParams({
+    select: 'id,clinic_code,patient_reference,service,status,created_at,responsible_lab',
+    order: 'created_at.desc,id.desc',
+    limit: String(pageSize),
+    offset: String(ordersOffset)
+  });
+  if (filter) query.set('responsible_lab', filter === 'unassigned' ? 'is.null' : 'eq.' + filter);
+  try {
+    const { records: orders, count } = await requestData('lab_orders?' + query, { headers: { Prefer: 'count=exact' } }, true);
+    if (requestVersion !== orderLoadVersion) return;
+    if (!orders.length && ordersOffset > 0) {
+      ordersOffset = Math.max(0, ordersOffset - pageSize);
+      return loadOrders();
+    }
+    orderList.replaceChildren(...orders.map(renderOrder));
+    const filterName = filter ? laboratoryNames.get(filter) || 'Sin asignar' : 'Todos los laboratorios';
+    savedCount.textContent = count === null ? filterName + ' · Consulta el listado para ver las órdenes.' : filterName + ' · ' + count + (count === 1 ? ' orden guardada' : ' órdenes guardadas');
+    orderListStatus.textContent = orders.length
+      ? 'Órdenes ' + (ordersOffset + 1) + ' a ' + (ordersOffset + orders.length) + (count === null ? '' : ' de ' + count)
+      : 'No hay órdenes para este filtro.';
+    previousPage.disabled = ordersOffset === 0;
+    nextPage.disabled = count === null ? orders.length < pageSize : ordersOffset + orders.length >= count;
+    savedPages.hidden = previousPage.disabled && nextPage.disabled;
+  } catch (error) {
+    if (requestVersion !== orderLoadVersion) return;
+    savedCount.textContent = 'No se pudieron consultar las órdenes.';
+    orderListStatus.textContent = savedCount.textContent;
+    throw error;
+  }
+}
+
+function setOrderLabFilter(value) {
+  orderLabFilter.value = value;
+  ordersOffset = 0;
+  refreshOrderList();
+}
+
+function refreshOrderList() {
+  savedPages.hidden = true;
+  savedCount.textContent = 'Consultando órdenes…';
+  orderList.replaceChildren();
+  orderListStatus.textContent = 'Consultando órdenes…';
+  void loadOrders().catch(() => {});
+}
+
+previousPage.addEventListener('click', () => {
+  ordersOffset = Math.max(0, ordersOffset - pageSize);
+  refreshOrderList();
+});
+nextPage.addEventListener('click', () => {
+  ordersOffset += pageSize;
+  refreshOrderList();
+});
+orderLabFilter.addEventListener('change', () => setOrderLabFilter(orderLabFilter.value));
 
 async function showOrders(roleCode) {
   area.hidden = false;
   const external = roleCode === 'external';
   const allowed = external || roleCode === 'admin' || roleCode === 'super_admin';
+  canAssignLab = allowed && !external;
+  orderLabField.hidden = !canAssignLab;
+  orderLab.disabled = !canAssignLab;
+  orderLab.required = canAssignLab;
+  orderLabFilter.hidden = !allowed;
+  orderLabFilterLabel.hidden = !allowed;
+  savedSummary.hidden = !allowed;
   if (!allowed) {
     orderStatus.textContent = 'Esta cuenta aún no tiene acceso al registro de órdenes.';
     return;
@@ -357,16 +518,26 @@ orderForm.addEventListener('submit', async event => {
     orderStatus.textContent = 'Completa la clínica, la referencia del paciente y el servicio.';
     return;
   }
+  const order = { clinic_code, patient_reference, service, observations };
+  if (canAssignLab) {
+    if (!laboratoryNames.has(orderLab.value)) {
+      orderStatus.textContent = 'Selecciona el laboratorio responsable.';
+      return;
+    }
+    order.responsible_lab = orderLab.value;
+  }
   orderSubmit.disabled = true;
   logout.disabled = true;
   try {
     await requestData('lab_orders', {
       method: 'POST', headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify({ clinic_code, patient_reference, service, observations })
+      body: JSON.stringify(order)
     });
     orderForm.elements.patient.value = '';
     orderForm.elements.service.value = '';
     orderForm.elements.observations.value = '';
+    orderLab.value = '';
+    ordersOffset = 0;
     try {
       await loadOrders();
       orderStatus.textContent = 'Orden guardada en el entorno de pruebas.';
@@ -441,10 +612,10 @@ form.addEventListener('submit', async event => {
     }
     if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
       try {
-        const { mountWorkspace } = await import('./workspace.js');
+        const { mountWorkspace } = await import('./workspace.js?v=laboratorios');
         const stylesheet = document.createElement('link');
         stylesheet.rel = 'stylesheet';
-        stylesheet.href = './workspace.css';
+        stylesheet.href = './workspace.css?v=laboratorios';
         const stylesReady = new Promise((resolve, reject) => {
           stylesheet.onload = resolve;
           stylesheet.onerror = reject;
@@ -453,10 +624,12 @@ form.addEventListener('submit', async event => {
         try { await stylesReady; } catch (error) { stylesheet.remove(); throw error; }
         const unmount = mountWorkspace(workspace, {
           label: role, canApprove: rows[0].role !== 'external',
-          orders: area, requests: pendingAdmin, home: entrance.querySelector('main'),
-          signOut: () => logout.click()
+          orders: area, summary: savedSummary, requests: pendingAdmin, home: entrance.querySelector('main'),
+          signOut: () => logout.click(), setLabFilter: setOrderLabFilter
         });
         unmountWorkspace = () => { unmount(); stylesheet.remove(); };
+        orderLabFilter.hidden = true;
+        orderLabFilterLabel.hidden = true;
         entrance.hidden = true;
         workspace.hidden = false;
       } catch {
@@ -490,8 +663,14 @@ logout.addEventListener('click', async () => {
   pendingList.replaceChildren();
   adminStatus.textContent = '';
   area.hidden = true;
+  savedSummary.hidden = true;
+  savedPages.hidden = true;
+  ordersOffset = 0;
   orderForm.hidden = true;
   orderForm.reset();
+  ++orderLoadVersion;
+  orderLabFilter.value = '';
+  orderListStatus.textContent = '';
   orderList.replaceChildren();
   clinicSelect.replaceChildren();
   orderStatus.textContent = '';
