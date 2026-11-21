@@ -141,19 +141,6 @@
     <button id="view-saved-orders" class="secondary" type="button">Ver órdenes guardadas</button>
   </section>
   <section id="orders-area" hidden>
-    <form id="order-form" hidden>
-      <h2>Nueva orden</h2>
-      <div class="orders-grid">
-        <div><label for="clinic">Código de clínica</label><input id="clinic" name="clinic" maxlength="80" list="registered-clinic-codes" required><datalist id="registered-clinic-codes"></datalist><select id="clinic-options" aria-label="Clínica autorizada" required hidden></select></div>
-        <div><label for="patient">Referencia ficticia del paciente</label><input id="patient" name="patient" maxlength="80" placeholder="Ej. PAC-QA-001" required></div>
-      </div>
-      <label for="service">Servicio solicitado</label><select id="service" name="service" required></select>
-      <div id="order-lab-field" hidden><label for="order-lab">Laboratorio responsable</label>
-        <select id="order-lab" name="responsible_lab" disabled></select>
-      </div>
-      <label for="observations">Observaciones</label><textarea id="observations" name="observations" rows="3" maxlength="1000"></textarea>
-      <button type="submit">Guardar orden</button>
-    </form>
     <h2>Listado de órdenes</h2>
     <p id="orders-status" role="status"></p>
     <label id="order-filter-label" for="order-lab-filter">Filtrar por laboratorio</label>
@@ -326,22 +313,14 @@ function renderPendingRequests() {
 }
 
 const area = document.querySelector('#orders-area');
-const orderForm = document.querySelector('#order-form');
 const orderStatus = document.querySelector('#orders-status');
 const orderList = document.querySelector('#order-list');
-const clinicInput = orderForm.elements.clinic;
-const clinicCodes = document.querySelector('#registered-clinic-codes');
-const clinicSelect = document.querySelector('#clinic-options');
-const orderSubmit = orderForm.querySelector('button');
-const orderLabField = document.querySelector('#order-lab-field');
-const orderLab = orderForm.elements.responsible_lab;
 const orderLabFilter = document.querySelector('#order-lab-filter');
 const orderLabFilterLabel = document.querySelector('#order-filter-label');
 const orderListStatus = document.querySelector('#order-list-status');
 const orderClinicFilter = document.querySelector('#order-clinic-filter');
 const orderClinicFilterLabel = document.querySelector('#order-clinic-filter-label');
 const orderClinicFilterHint = document.querySelector('#order-clinic-filter-hint');
-const serviceInput = orderForm.elements.service;
 let registeredClinics = [];
 let selectedClinics = [];
 let pendingRequests = [];
@@ -362,7 +341,6 @@ function getClinicOptions() {
 }
 
 function notifyClinics() {
-  clinicCodes.replaceChildren(...registeredClinics.map(code => new Option(code, code)));
   orderClinicFilter.replaceChildren(...registeredClinics.map(code => new Option(code, code, false, selectedClinics.includes(code))));
   area.dispatchEvent(new Event('clinics-changed'));
 }
@@ -384,7 +362,6 @@ const laboratoryNames = new Map([
   ['jk_ceramic_lab', 'J & K Ceramic Lab'],
 ]);
 const labOptions = () => [...laboratoryNames].map(([code, name]) => new Option(name, code));
-orderLab.replaceChildren(new Option('Selecciona un laboratorio', ''), ...labOptions());
 orderLabFilter.replaceChildren(new Option('Todos los laboratorios', ''), ...labOptions(), new Option('Sin asignar', 'unassigned'));
 const savedSummary = document.querySelector('#saved-order-summary');
 const savedCount = document.querySelector('#saved-order-count');
@@ -403,7 +380,9 @@ async function requestData(path, options = {}, includeCount = false) {
   });
   if (!response.ok) {
     const error = new Error('Request failed');
-    error.code = (await response.json().catch(() => null))?.code;
+    const issue = await response.json().catch(() => null);
+    error.code = issue?.code;
+    error.databaseMessage = issue?.message;
     throw error;
   }
   if (includeCount) {
@@ -430,25 +409,40 @@ async function loadClinics() {
   notifyClinics();
 }
 
-function showCatalogInOrderForm() {
-  const current = serviceInput.value;
-  const options = [new Option('Selecciona un servicio', '')];
-  const categories = [...new Set(catalogEntries.map(item => item.category))];
-  for (const category of categories) {
-    const group = document.createElement('optgroup');
-    group.label = category;
-    group.append(...catalogEntries.filter(item => item.category === category).map(item => new Option(item.label, item.id)));
-    options.push(group);
+const getOrderClinics = () => registeredClinics.map(code => ({ id: code, name: code }));
+const getDoctors = clinic => readAll('rpc/lab_order_doctors?' + new URLSearchParams({ clinic, order: 'name,id' }));
+async function findPatient(clinic, doc_type, doc_number) {
+  const [patient] = await requestData('rpc/lab_order_patient', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clinic, doc_type, doc_number })
+  });
+  return patient;
+}
+
+async function createOrder(payload) {
+  const currentToken = token;
+  let id;
+  try {
+    id = await requestData('rpc/lab_create_complete_order', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload })
+    });
+  } catch (error) {
+    throw new Error(error.code === '22023' && error.databaseMessage
+      ? error.databaseMessage
+      : 'No se pudo confirmar el registro de la orden. Puedes reintentar sin duplicarla.');
   }
-  serviceInput.replaceChildren(...options);
-  if (catalogEntries.some(item => item.id === current)) serviceInput.value = current;
-  orderSubmit.disabled = !catalogEntries.length;
+  if (currentToken === token) {
+    rememberClinic(payload.clinic);
+    ordersOffset = 0;
+    void loadOrders().catch(() => {});
+  }
+  return id;
 }
 
 const catalogFields = 'id,category,service,variant,label,amount,original';
 async function loadCatalog() {
   catalogEntries = await readAll('lab_catalog_services?select=' + catalogFields + '&order=category.asc,label.asc,id.asc');
-  showCatalogInOrderForm();
 }
 
 async function addService(category, service, amount) {
@@ -460,7 +454,6 @@ async function addService(category, service, amount) {
     });
     if (!entry || token !== currentToken) throw new Error('Missing catalog service');
     catalogEntries = [...catalogEntries, entry];
-    showCatalogInOrderForm();
     return catalogEntries;
   } catch (error) {
     throw new Error(error.code === '23505' ? 'Ya existe un servicio con ese nombre.' : 'No se pudo guardar el servicio.');
@@ -487,10 +480,35 @@ function renderOrder(order) {
   const reference = order.id.slice(0, 8).toUpperCase();
   const currentLab = laboratoryNames.get(order.responsible_lab) || 'Sin asignar';
   const details = document.createElement('div');
-  details.textContent = [reference, order.service, order.clinic_code, order.patient_reference, order.status, time].join(' · ');
+  details.textContent = [reference, order.service, order.clinic_code, order.order_details?.patientName || order.patient_reference, order.status, time].join(' · ');
   const lab = document.createElement('strong');
   lab.textContent = 'Laboratorio: ' + currentLab;
   item.append(details, lab);
+  if (order.order_details) {
+    const info = order.order_details;
+    const money = new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 });
+    const expanded = document.createElement('details');
+    const heading = document.createElement('summary');
+    heading.textContent = 'Ver detalle de la orden ' + reference;
+    expanded.append(heading);
+    const lines = [
+      ['Doctor', info.doctorName],
+      ['Trabajo', [info.category, info.service, info.variant].filter(Boolean).join(' · ')],
+      ['Color', info.color], ['Nomenclatura', info.references?.join(', ')], ['Cantidad', info.quantity],
+      ['Tarifa unitaria', info.unitPrice == null ? 'Pendiente' : money.format(info.unitPrice)],
+      ['Dientes', info.teeth ? ({ biodent: 'Biodent', 'duratone-n': 'Duratone-N', 'super-c': 'Super-C', 'cid-votar': 'CID / VOTAR' })[info.teeth.brand] : ''],
+      ['Reglas por prótesis', info.teeth?.rulesPerProsthesis],
+      ['Adicional de dientes', info.teeth ? money.format(info.teeth.extraTotal) : ''],
+      ['Valor del trabajo', info.total == null ? 'Pendiente' : money.format(info.total)], ['Observaciones', order.observations]
+    ];
+    for (const [name, value] of lines) {
+      if (value === '' || value == null) continue;
+      const line = document.createElement('div');
+      line.textContent = name + ': ' + value;
+      expanded.append(line);
+    }
+    item.append(expanded);
+  }
 
   if (canAssignLab) {
     const controls = document.createElement('div');
@@ -549,7 +567,7 @@ async function loadOrders() {
   const requestVersion = ++orderLoadVersion;
   const filter = orderLabFilter.value;
   const query = new URLSearchParams({
-    select: 'id,clinic_code,patient_reference,service,status,created_at,responsible_lab',
+    select: 'id,clinic_code,patient_reference,service,status,created_at,responsible_lab,observations,order_details',
     order: 'created_at.desc,id.desc',
     limit: String(pageSize),
     offset: String(ordersOffset)
@@ -620,9 +638,6 @@ async function showOrders(roleCode) {
   const external = roleCode === 'external';
   const allowed = external || roleCode === 'admin' || roleCode === 'super_admin';
   canAssignLab = allowed && !external;
-  orderLabField.hidden = !canAssignLab;
-  orderLab.disabled = !canAssignLab;
-  orderLab.required = canAssignLab;
   orderLabFilter.hidden = !allowed;
   orderLabFilterLabel.hidden = !allowed;
   savedSummary.hidden = !allowed;
@@ -630,67 +645,11 @@ async function showOrders(roleCode) {
     orderStatus.textContent = 'Esta cuenta aún no tiene acceso al registro de órdenes.';
     return;
   }
-  clinicInput.hidden = external;
-  clinicInput.disabled = external;
-  clinicSelect.hidden = !external;
-  clinicSelect.disabled = !external;
-  if (external) {
-    clinicSelect.replaceChildren(...registeredClinics.map(code => new Option(code, code)));
-    if (!registeredClinics.length) {
-      orderStatus.textContent = 'La cuenta aún no tiene una clínica asignada.';
-      return;
-    }
+  if (external && !registeredClinics.length) {
+    orderStatus.textContent = 'La cuenta aún no tiene una clínica asignada.';
   }
-  orderForm.hidden = false;
   await loadOrders();
 }
-
-orderForm.addEventListener('submit', async event => {
-  event.preventDefault();
-  if (!token || orderSubmit.disabled) return;
-  const clinic_code = (clinicSelect.disabled ? clinicInput.value : clinicSelect.value).trim();
-  const patient_reference = orderForm.elements.patient.value.trim();
-  const catalogService = catalogEntries.find(item => item.id === serviceInput.value);
-  const observations = orderForm.elements.observations.value.trim();
-  if (!clinic_code || !patient_reference || !catalogService) {
-    orderStatus.textContent = 'Completa la clínica, la referencia del paciente y el servicio.';
-    return;
-  }
-  const order = { clinic_code, patient_reference, service: catalogService.label, catalog_service_id: catalogService.id, observations };
-  if (canAssignLab) {
-    if (!laboratoryNames.has(orderLab.value)) {
-      orderStatus.textContent = 'Selecciona el laboratorio responsable.';
-      return;
-    }
-    order.responsible_lab = orderLab.value;
-  }
-  orderSubmit.disabled = true;
-  logout.disabled = true;
-  try {
-    await requestData('lab_orders', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify(order)
-    });
-    orderForm.elements.patient.value = '';
-    serviceInput.value = '';
-    rememberClinic(clinic_code);
-    orderForm.elements.observations.value = '';
-    orderLab.value = '';
-    ordersOffset = 0;
-    try {
-      await loadOrders();
-      orderStatus.textContent = 'Orden guardada en el entorno de pruebas.';
-    } catch {
-      orderStatus.textContent = 'Orden guardada. Vuelve a iniciar sesión para actualizar el listado.';
-    }
-  } catch {
-    await loadOrders().catch(() => {});
-    orderStatus.textContent = 'No se pudo confirmar el guardado. Revisa primero el listado antes de volver a enviar.';
-  } finally {
-    orderSubmit.disabled = false;
-    logout.disabled = false;
-  }
-});
 
 async function revoke(accessToken) {
   if (!accessToken) return true;
@@ -748,7 +707,6 @@ form.addEventListener('submit', async event => {
     if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
       await Promise.allSettled([loadClinics(), loadCatalog()]);
       if (!catalogEntries.length) {
-        orderSubmit.disabled = true;
         orderStatus.textContent = 'El catálogo no está disponible. Vuelve a iniciar sesión para crear una orden.';
       }
     }
@@ -758,10 +716,10 @@ form.addEventListener('submit', async event => {
     }
     if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
       try {
-        const { mountWorkspace } = await import('./workspace.js?v=ordenes-catalogo');
+        const { mountWorkspace } = await import('./workspace.js?v=formulario-orden');
         const stylesheet = document.createElement('link');
         stylesheet.rel = 'stylesheet';
-        stylesheet.href = './workspace.css?v=ordenes-catalogo';
+        stylesheet.href = './workspace.css?v=formulario-orden';
         const stylesReady = new Promise((resolve, reject) => {
           stylesheet.onload = resolve;
           stylesheet.onerror = reject;
@@ -773,7 +731,7 @@ form.addEventListener('submit', async event => {
           orders: area, summary: savedSummary, requests: pendingAdmin, home: entrance.querySelector('main'),
           signOut: () => logout.click(), setLabFilter: setOrderLabFilter,
           getClinicOptions, subscribeClinics, setClinicFilter: setOrderClinicFilter,
-          getCatalog: () => catalogEntries, addService, setPrice
+          getCatalog: () => catalogEntries, addService, setPrice, getOrderClinics, getDoctors, findPatient, createOrder
         });
         unmountWorkspace = () => { unmount(); stylesheet.remove(); };
         orderLabFilter.hidden = true;
@@ -817,8 +775,6 @@ logout.addEventListener('click', async () => {
   savedSummary.hidden = true;
   savedPages.hidden = true;
   ordersOffset = 0;
-  orderForm.hidden = true;
-  orderForm.reset();
   ++orderLoadVersion;
   orderLabFilter.value = '';
   registeredClinics = [];
@@ -826,14 +782,11 @@ logout.addEventListener('click', async () => {
   pendingRequests = [];
   catalogEntries = [];
   orderClinicFilter.replaceChildren();
-  clinicCodes.replaceChildren();
   orderClinicFilter.hidden = false;
   orderClinicFilterLabel.hidden = false;
   orderClinicFilterHint.hidden = false;
-  showCatalogInOrderForm();
   orderListStatus.textContent = '';
   orderList.replaceChildren();
-  clinicSelect.replaceChildren();
   orderStatus.textContent = '';
   logout.hidden = true;
   logout.disabled = false;
