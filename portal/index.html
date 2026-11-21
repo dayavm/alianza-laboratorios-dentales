@@ -136,13 +136,13 @@
     <div id="pending-list"></div>
   </section>
   <section id="saved-order-summary" class="panel lab-order-summary" hidden>
-    <h2>Órdenes guardadas</h2>
+    <h2>Órdenes de trabajo</h2>
     <p id="saved-order-count" role="status"></p>
     <button id="view-saved-orders" class="secondary" type="button">Ver órdenes guardadas</button>
   </section>
   <section id="orders-area" hidden>
-    <h2>Órdenes de trabajo</h2>
     <form id="order-form" hidden>
+      <h2>Nueva orden</h2>
       <div class="orders-grid">
         <div><label for="clinic">Código de clínica</label><input id="clinic" name="clinic" maxlength="80" list="registered-clinic-codes" required><datalist id="registered-clinic-codes"></datalist><select id="clinic-options" aria-label="Clínica autorizada" required hidden></select></div>
         <div><label for="patient">Referencia ficticia del paciente</label><input id="patient" name="patient" maxlength="80" placeholder="Ej. PAC-QA-001" required></div>
@@ -154,6 +154,7 @@
       <label for="observations">Observaciones</label><textarea id="observations" name="observations" rows="3" maxlength="1000"></textarea>
       <button type="submit">Guardar orden</button>
     </form>
+    <h2>Listado de órdenes</h2>
     <p id="orders-status" role="status"></p>
     <label id="order-filter-label" for="order-lab-filter">Filtrar por laboratorio</label>
     <select id="order-lab-filter" aria-labelledby="order-filter-label"></select>
@@ -566,7 +567,7 @@ async function loadOrders() {
     const laboratory = filter ? laboratoryNames.get(filter) || 'Sin asignar' : 'Todos los laboratorios';
     const clinic = selectedClinics.length === 1 ? getClinicOptions().find(item => item.id === selectedClinics[0])?.name || selectedClinics[0] : selectedClinics.length ? selectedClinics.length + ' clínicas' : 'Todas las clínicas';
     const filterName = laboratory + ' · ' + clinic;
-    savedCount.textContent = count === null ? filterName + ' · Consulta el listado para ver las órdenes.' : filterName + ' · ' + count + (count === 1 ? ' orden guardada' : ' órdenes guardadas');
+    savedCount.textContent = count === null ? filterName + ' · Consulta el listado para ver las órdenes.' : filterName + ' · ' + count + (count === 1 ? ' orden' : ' órdenes');
     orderListStatus.textContent = orders.length
       ? 'Órdenes ' + (ordersOffset + 1) + ' a ' + (ordersOffset + orders.length) + (count === null ? '' : ' de ' + count)
       : 'No hay órdenes para este filtro.';
@@ -757,10 +758,10 @@ form.addEventListener('submit', async event => {
     }
     if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
       try {
-        const { mountWorkspace } = await import('./workspace.js?v=clinicas-catalogo');
+        const { mountWorkspace } = await import('./workspace.js?v=ordenes-catalogo');
         const stylesheet = document.createElement('link');
         stylesheet.rel = 'stylesheet';
-        stylesheet.href = './workspace.css?v=clinicas-catalogo';
+        stylesheet.href = './workspace.css?v=ordenes-catalogo';
         const stylesReady = new Promise((resolve, reject) => {
           stylesheet.onload = resolve;
           stylesheet.onerror = reject;
