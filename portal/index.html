@@ -144,10 +144,10 @@
     <h2>Órdenes de trabajo</h2>
     <form id="order-form" hidden>
       <div class="orders-grid">
-        <div><label for="clinic">Código de clínica</label><input id="clinic" name="clinic" maxlength="80" required><select id="clinic-options" aria-label="Clínica autorizada" required hidden></select></div>
+        <div><label for="clinic">Código de clínica</label><input id="clinic" name="clinic" maxlength="80" list="registered-clinic-codes" required><datalist id="registered-clinic-codes"></datalist><select id="clinic-options" aria-label="Clínica autorizada" required hidden></select></div>
         <div><label for="patient">Referencia ficticia del paciente</label><input id="patient" name="patient" maxlength="80" placeholder="Ej. PAC-QA-001" required></div>
       </div>
-      <label for="service">Servicio solicitado</label><input id="service" name="service" maxlength="120" required>
+      <label for="service">Servicio solicitado</label><select id="service" name="service" required></select>
       <div id="order-lab-field" hidden><label for="order-lab">Laboratorio responsable</label>
         <select id="order-lab" name="responsible_lab" disabled></select>
       </div>
@@ -157,6 +157,9 @@
     <p id="orders-status" role="status"></p>
     <label id="order-filter-label" for="order-lab-filter">Filtrar por laboratorio</label>
     <select id="order-lab-filter" aria-labelledby="order-filter-label"></select>
+    <label id="order-clinic-filter-label" for="order-clinic-filter">Filtrar por clínica</label>
+    <select id="order-clinic-filter" multiple size="4" aria-describedby="order-clinic-filter-hint"></select>
+    <small id="order-clinic-filter-hint">Puedes seleccionar varias clínicas. Borra la selección para verlas todas.</small>
     <p id="order-list-status" role="status"></p>
     <ul id="order-list" class="order-list"></ul>
     <div class="order-lab-controls" id="saved-order-pages" hidden>
@@ -275,7 +278,14 @@ requestForm.addEventListener('submit', async event => {
 
 async function showPendingRequests() {
   pendingAdmin.hidden = false;
-  const requests = await requestData('lab_access_requests?select=user_id,email,clinic_name&status=eq.pending&order=created_at.asc&limit=100');
+  pendingRequests = await readAll('lab_access_requests?select=user_id,email,clinic_name&status=eq.pending&order=created_at.asc,user_id.asc');
+  notifyClinics();
+  renderPendingRequests();
+}
+
+function renderPendingRequests() {
+  const selected = selectedClinics.map(normalizeClinic);
+  const requests = pendingRequests.filter(item => !selected.length || selected.includes(normalizeClinic(item.clinic_name)) || selected.includes(normalizeClinic(requestClinicId(item.clinic_name))));
   pendingList.replaceChildren(...requests.map(item => {
     const row = document.createElement('form');
     const title = document.createElement('p');
@@ -299,7 +309,9 @@ async function showPendingRequests() {
           method: 'POST', headers: {'Content-Type':'application/json'},
           body: JSON.stringify({p_user_id:item.user_id, p_clinic_code:code.value.trim()})
         });
-        row.remove();
+        pendingRequests = pendingRequests.filter(request => request.user_id !== item.user_id);
+        rememberClinic(code.value.trim());
+        renderPendingRequests();
         adminStatus.textContent = 'Acceso aprobado para la clínica indicada.';
       } catch {
         adminStatus.textContent = 'No se pudo confirmar la aprobación. Revisa el código o vuelve a iniciar sesión.';
@@ -309,7 +321,7 @@ async function showPendingRequests() {
     });
     return row;
   }));
-  adminStatus.textContent = requests.length ? '' : 'No hay solicitudes pendientes.';
+  adminStatus.textContent = requests.length ? '' : 'No hay solicitudes pendientes para las clínicas seleccionadas.';
 }
 
 const area = document.querySelector('#orders-area');
@@ -317,6 +329,7 @@ const orderForm = document.querySelector('#order-form');
 const orderStatus = document.querySelector('#orders-status');
 const orderList = document.querySelector('#order-list');
 const clinicInput = orderForm.elements.clinic;
+const clinicCodes = document.querySelector('#registered-clinic-codes');
 const clinicSelect = document.querySelector('#clinic-options');
 const orderSubmit = orderForm.querySelector('button');
 const orderLabField = document.querySelector('#order-lab-field');
@@ -324,6 +337,47 @@ const orderLab = orderForm.elements.responsible_lab;
 const orderLabFilter = document.querySelector('#order-lab-filter');
 const orderLabFilterLabel = document.querySelector('#order-filter-label');
 const orderListStatus = document.querySelector('#order-list-status');
+const orderClinicFilter = document.querySelector('#order-clinic-filter');
+const orderClinicFilterLabel = document.querySelector('#order-clinic-filter-label');
+const orderClinicFilterHint = document.querySelector('#order-clinic-filter-hint');
+const serviceInput = orderForm.elements.service;
+let registeredClinics = [];
+let selectedClinics = [];
+let pendingRequests = [];
+let catalogEntries = [];
+
+const normalizeClinic = value => value.trim().toLocaleLowerCase('es');
+const requestClinicId = name => 'request:' + normalizeClinic(name);
+function getClinicOptions() {
+  const clinics = registeredClinics.map(code => ({ id: code, name: code }));
+  const names = new Set(registeredClinics.map(normalizeClinic));
+  for (const { clinic_name } of pendingRequests) {
+    const name = normalizeClinic(clinic_name);
+    if (names.has(name)) continue;
+    names.add(name);
+    clinics.push({ id: requestClinicId(clinic_name), name: clinic_name + ' (solicitud)' });
+  }
+  return clinics;
+}
+
+function notifyClinics() {
+  clinicCodes.replaceChildren(...registeredClinics.map(code => new Option(code, code)));
+  orderClinicFilter.replaceChildren(...registeredClinics.map(code => new Option(code, code, false, selectedClinics.includes(code))));
+  area.dispatchEvent(new Event('clinics-changed'));
+}
+
+function subscribeClinics(callback) {
+  const listener = () => callback(getClinicOptions());
+  area.addEventListener('clinics-changed', listener);
+  return () => area.removeEventListener('clinics-changed', listener);
+}
+
+function rememberClinic(code) {
+  if (!registeredClinics.includes(code)) {
+    registeredClinics = [...registeredClinics, code].sort((a, b) => a.localeCompare(b, 'es'));
+    notifyClinics();
+  }
+}
 const laboratoryNames = new Map([
   ['smile_esthetic', 'Smile Esthetic'],
   ['jk_ceramic_lab', 'J & K Ceramic Lab'],
@@ -346,12 +400,84 @@ async function requestData(path, options = {}, includeCount = false) {
     ...options,
     headers: { apikey, Authorization: 'Bearer ' + token, ...options.headers }
   });
-  if (!response.ok) throw new Error('Request failed');
+  if (!response.ok) {
+    const error = new Error('Request failed');
+    error.code = (await response.json().catch(() => null))?.code;
+    throw error;
+  }
   if (includeCount) {
     const total = response.headers.get('content-range')?.split('/').at(-1);
     return { records: await response.json(), count: total && total !== '*' ? Number(total) : null };
   }
   return response.status === 204 ? null : response.json();
+}
+
+async function readAll(path) {
+  const result = [];
+  const pageSize = 250;
+  for (let offset = 0; ; offset += pageSize) {
+    const separator = path.includes('?') ? '&' : '?';
+    const page = await requestData(path + separator + 'limit=' + pageSize + '&offset=' + offset);
+    result.push(...page);
+    if (page.length < pageSize) return result;
+  }
+}
+
+async function loadClinics() {
+  const clinics = await readAll('rpc/lab_visible_clinics?order=clinic_code');
+  registeredClinics = clinics.map(clinic => clinic.clinic_code);
+  notifyClinics();
+}
+
+function showCatalogInOrderForm() {
+  const current = serviceInput.value;
+  const options = [new Option('Selecciona un servicio', '')];
+  const categories = [...new Set(catalogEntries.map(item => item.category))];
+  for (const category of categories) {
+    const group = document.createElement('optgroup');
+    group.label = category;
+    group.append(...catalogEntries.filter(item => item.category === category).map(item => new Option(item.label, item.id)));
+    options.push(group);
+  }
+  serviceInput.replaceChildren(...options);
+  if (catalogEntries.some(item => item.id === current)) serviceInput.value = current;
+  orderSubmit.disabled = !catalogEntries.length;
+}
+
+const catalogFields = 'id,category,service,variant,label,amount,original';
+async function loadCatalog() {
+  catalogEntries = await readAll('lab_catalog_services?select=' + catalogFields + '&order=category.asc,label.asc,id.asc');
+  showCatalogInOrderForm();
+}
+
+async function addService(category, service, amount) {
+  const currentToken = token;
+  try {
+    const [entry] = await requestData('lab_catalog_services?select=' + catalogFields, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify({ category, service, amount })
+    });
+    if (!entry || token !== currentToken) throw new Error('Missing catalog service');
+    catalogEntries = [...catalogEntries, entry];
+    showCatalogInOrderForm();
+    return catalogEntries;
+  } catch (error) {
+    throw new Error(error.code === '23505' ? 'Ya existe un servicio con ese nombre.' : 'No se pudo guardar el servicio.');
+  }
+}
+
+async function setPrice(id, amount) {
+  const currentToken = token;
+  try {
+    const [entry] = await requestData('lab_catalog_services?id=eq.' + encodeURIComponent(id) + '&select=' + catalogFields, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify({ amount })
+    });
+    if (!entry || token !== currentToken) throw new Error('Missing catalog service');
+    catalogEntries = catalogEntries.map(item => item.id === id ? entry : item);
+  } catch {
+    throw new Error('No se pudo actualizar la tarifa.');
+  }
 }
 
 function renderOrder(order) {
@@ -428,6 +554,7 @@ async function loadOrders() {
     offset: String(ordersOffset)
   });
   if (filter) query.set('responsible_lab', filter === 'unassigned' ? 'is.null' : 'eq.' + filter);
+  if (selectedClinics.length) query.set('clinic_code', 'in.(' + selectedClinics.map(code => JSON.stringify(code)).join(',') + ')');
   try {
     const { records: orders, count } = await requestData('lab_orders?' + query, { headers: { Prefer: 'count=exact' } }, true);
     if (requestVersion !== orderLoadVersion) return;
@@ -436,7 +563,9 @@ async function loadOrders() {
       return loadOrders();
     }
     orderList.replaceChildren(...orders.map(renderOrder));
-    const filterName = filter ? laboratoryNames.get(filter) || 'Sin asignar' : 'Todos los laboratorios';
+    const laboratory = filter ? laboratoryNames.get(filter) || 'Sin asignar' : 'Todos los laboratorios';
+    const clinic = selectedClinics.length === 1 ? getClinicOptions().find(item => item.id === selectedClinics[0])?.name || selectedClinics[0] : selectedClinics.length ? selectedClinics.length + ' clínicas' : 'Todas las clínicas';
+    const filterName = laboratory + ' · ' + clinic;
     savedCount.textContent = count === null ? filterName + ' · Consulta el listado para ver las órdenes.' : filterName + ' · ' + count + (count === 1 ? ' orden guardada' : ' órdenes guardadas');
     orderListStatus.textContent = orders.length
       ? 'Órdenes ' + (ordersOffset + 1) + ' a ' + (ordersOffset + orders.length) + (count === null ? '' : ' de ' + count)
@@ -457,6 +586,15 @@ function setOrderLabFilter(value) {
   ordersOffset = 0;
   refreshOrderList();
 }
+
+function setOrderClinicFilter(values) {
+  selectedClinics = values;
+  ordersOffset = 0;
+  refreshOrderList();
+  if (canAssignLab && !pendingAdmin.hidden) renderPendingRequests();
+}
+
+orderClinicFilter.addEventListener('change', () => setOrderClinicFilter([...orderClinicFilter.selectedOptions].map(option => option.value)));
 
 function refreshOrderList() {
   savedPages.hidden = true;
@@ -496,9 +634,8 @@ async function showOrders(roleCode) {
   clinicSelect.hidden = !external;
   clinicSelect.disabled = !external;
   if (external) {
-    const scopes = await requestData('lab_order_scopes?select=clinic_code&order=clinic_code');
-    clinicSelect.replaceChildren(...scopes.map(scope => new Option(scope.clinic_code, scope.clinic_code)));
-    if (!scopes.length) {
+    clinicSelect.replaceChildren(...registeredClinics.map(code => new Option(code, code)));
+    if (!registeredClinics.length) {
       orderStatus.textContent = 'La cuenta aún no tiene una clínica asignada.';
       return;
     }
@@ -512,13 +649,13 @@ orderForm.addEventListener('submit', async event => {
   if (!token || orderSubmit.disabled) return;
   const clinic_code = (clinicSelect.disabled ? clinicInput.value : clinicSelect.value).trim();
   const patient_reference = orderForm.elements.patient.value.trim();
-  const service = orderForm.elements.service.value.trim();
+  const catalogService = catalogEntries.find(item => item.id === serviceInput.value);
   const observations = orderForm.elements.observations.value.trim();
-  if (!clinic_code || !patient_reference || !service) {
+  if (!clinic_code || !patient_reference || !catalogService) {
     orderStatus.textContent = 'Completa la clínica, la referencia del paciente y el servicio.';
     return;
   }
-  const order = { clinic_code, patient_reference, service, observations };
+  const order = { clinic_code, patient_reference, service: catalogService.label, catalog_service_id: catalogService.id, observations };
   if (canAssignLab) {
     if (!laboratoryNames.has(orderLab.value)) {
       orderStatus.textContent = 'Selecciona el laboratorio responsable.';
@@ -534,7 +671,8 @@ orderForm.addEventListener('submit', async event => {
       body: JSON.stringify(order)
     });
     orderForm.elements.patient.value = '';
-    orderForm.elements.service.value = '';
+    serviceInput.value = '';
+    rememberClinic(clinic_code);
     orderForm.elements.observations.value = '';
     orderLab.value = '';
     ordersOffset = 0;
@@ -606,16 +744,23 @@ form.addEventListener('submit', async event => {
     form.hidden = true;
     logout.hidden = false;
     logout.disabled = true;
+    if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
+      await Promise.allSettled([loadClinics(), loadCatalog()]);
+      if (!catalogEntries.length) {
+        orderSubmit.disabled = true;
+        orderStatus.textContent = 'El catálogo no está disponible. Vuelve a iniciar sesión para crear una orden.';
+      }
+    }
     await showOrders(rows[0].role).catch(() => { orderStatus.textContent = 'No se pudieron consultar las órdenes. Intenta iniciar sesión nuevamente.'; });
     if (rows[0].role === 'admin' || rows[0].role === 'super_admin') {
       await showPendingRequests().catch(() => { adminStatus.textContent = 'No se pudieron cargar las solicitudes.'; });
     }
     if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
       try {
-        const { mountWorkspace } = await import('./workspace.js?v=laboratorios');
+        const { mountWorkspace } = await import('./workspace.js?v=clinicas-catalogo');
         const stylesheet = document.createElement('link');
         stylesheet.rel = 'stylesheet';
-        stylesheet.href = './workspace.css?v=laboratorios';
+        stylesheet.href = './workspace.css?v=clinicas-catalogo';
         const stylesReady = new Promise((resolve, reject) => {
           stylesheet.onload = resolve;
           stylesheet.onerror = reject;
@@ -625,11 +770,16 @@ form.addEventListener('submit', async event => {
         const unmount = mountWorkspace(workspace, {
           label: role, canApprove: rows[0].role !== 'external',
           orders: area, summary: savedSummary, requests: pendingAdmin, home: entrance.querySelector('main'),
-          signOut: () => logout.click(), setLabFilter: setOrderLabFilter
+          signOut: () => logout.click(), setLabFilter: setOrderLabFilter,
+          getClinicOptions, subscribeClinics, setClinicFilter: setOrderClinicFilter,
+          getCatalog: () => catalogEntries, addService, setPrice
         });
         unmountWorkspace = () => { unmount(); stylesheet.remove(); };
         orderLabFilter.hidden = true;
         orderLabFilterLabel.hidden = true;
+        orderClinicFilter.hidden = true;
+        orderClinicFilterLabel.hidden = true;
+        orderClinicFilterHint.hidden = true;
         entrance.hidden = true;
         workspace.hidden = false;
       } catch {
@@ -670,6 +820,16 @@ logout.addEventListener('click', async () => {
   orderForm.reset();
   ++orderLoadVersion;
   orderLabFilter.value = '';
+  registeredClinics = [];
+  selectedClinics = [];
+  pendingRequests = [];
+  catalogEntries = [];
+  orderClinicFilter.replaceChildren();
+  clinicCodes.replaceChildren();
+  orderClinicFilter.hidden = false;
+  orderClinicFilterLabel.hidden = false;
+  orderClinicFilterHint.hidden = false;
+  showCatalogInOrderForm();
   orderListStatus.textContent = '';
   orderList.replaceChildren();
   clinicSelect.replaceChildren();
