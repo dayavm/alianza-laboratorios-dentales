@@ -134,6 +134,9 @@
     <h2>Solicitudes pendientes</h2>
     <p id="admin-status" role="status"></p>
     <div id="pending-list"></div>
+    <section id="test-accounts" hidden><h2>Cuentas de prueba</h2>
+      <p id="test-message" role="status"></p><ul id="test-list" class="order-list"></ul>
+    </section>
   </section>
   <section id="saved-order-summary" class="panel lab-order-summary" hidden>
     <h2>Órdenes de trabajo</h2>
@@ -183,6 +186,10 @@ const requestForm = document.querySelector('#clinic-request-form');
 const requestStatus = document.querySelector('#request-status');
 const pendingAdmin = document.querySelector('#pending-admin');
 const pendingList = document.querySelector('#pending-list');
+const testArea = document.querySelector('#test-accounts');
+const testList = document.querySelector('#test-list');
+const testMessage = document.querySelector('#test-message');
+let isSuperAdmin = false;
 const adminStatus = document.querySelector('#admin-status');
 
 document.querySelector('#register-link').addEventListener('click', event => {
@@ -264,6 +271,44 @@ requestForm.addEventListener('submit', async event => {
   }
 });
 
+function changeTestAccount(action, userId) {
+  return requestData('rpc/' + action, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({p_user_id:userId})
+  });
+}
+async function loadTestAccounts() {
+  testArea.hidden = !isSuperAdmin;
+  if (!isSuperAdmin) return;
+  const accounts = await readAll('rpc/lab_list_test_accounts');
+  testList.replaceChildren(...accounts.map(account => {
+    const item = document.createElement('li');
+    const name = document.createElement('p');
+    name.textContent = account.email;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = 'Retirar acceso y borrar sus pruebas';
+    remove.addEventListener('click', async () => {
+      if (!window.confirm('¿Retirar el acceso de ' + account.email + ' y borrar definitivamente sus órdenes y fichas de prueba?')) return;
+      remove.disabled = true;
+      try {
+        await changeTestAccount('lab_retire_test_account', account.user_id);
+      } catch {
+        testMessage.textContent = 'No se pudo retirar la cuenta de prueba.';
+        remove.disabled = false;
+        return;
+      }
+      item.remove();
+      testMessage.textContent = 'Acceso retirado y datos de prueba eliminados.';
+      await loadClinics().catch(() => {});
+      await loadOrders().catch(() => {});
+    });
+    item.append(name, remove);
+    return item;
+  }));
+  testMessage.textContent = accounts.length ? '' : 'Todavía no hay cuentas de prueba activas.';
+}
+
 async function showPendingRequests() {
   pendingAdmin.hidden = false;
   pendingRequests = await readAll('lab_access_requests?select=user_id,email,clinic_name&status=eq.pending&order=created_at.asc,user_id.asc');
@@ -288,6 +333,27 @@ function renderPendingRequests() {
     const apply = document.createElement('button');
     apply.textContent = 'Aprobar acceso externo';
     row.append(title, label, apply);
+    if (isSuperAdmin) {
+      const test = document.createElement('button');
+      test.type = 'button';
+      test.textContent = 'Aprobar como prueba';
+      test.addEventListener('click', async () => {
+        if (apply.disabled) return;
+        test.disabled = true; apply.disabled = true;
+        try {
+          const clinic = await changeTestAccount('lab_approve_test_account', item.user_id);
+          pendingRequests = pendingRequests.filter(request => request.user_id !== item.user_id);
+          rememberClinic(clinic);
+          renderPendingRequests();
+          adminStatus.textContent = 'Cuenta aprobada como prueba.';
+          await loadTestAccounts().catch(() => { testMessage.textContent = 'No se pudo actualizar la lista de cuentas de prueba.'; });
+        } catch {
+          adminStatus.textContent = 'No se pudo aprobar la cuenta de prueba.';
+          test.disabled = false; apply.disabled = false;
+        }
+      });
+      row.append(test);
+    }
     row.addEventListener('submit', async event => {
       event.preventDefault();
       if (!token || apply.disabled) return;
@@ -477,7 +543,8 @@ async function setPrice(id, amount) {
 function renderOrder(order) {
   const item = document.createElement('li');
   const time = new Intl.DateTimeFormat('es-CO', { dateStyle: 'short', timeStyle: 'short', timeZone: 'America/Bogota' }).format(new Date(order.created_at));
-  const reference = order.id.slice(0, 8).toUpperCase();
+  const shortId = order.id.slice(0, 8).toUpperCase();
+  const reference = order.test_number == null ? shortId : 'PRUEBA-' + String(order.test_number).padStart(4, '0') + ' (' + shortId + ')';
   const currentLab = laboratoryNames.get(order.responsible_lab) || 'Sin asignar';
   const details = document.createElement('div');
   details.textContent = [reference, order.service, order.clinic_code, order.order_details?.patientName || order.patient_reference, order.status, time].join(' · ');
@@ -567,7 +634,7 @@ async function loadOrders() {
   const requestVersion = ++orderLoadVersion;
   const filter = orderLabFilter.value;
   const query = new URLSearchParams({
-    select: 'id,clinic_code,patient_reference,service,status,created_at,responsible_lab,observations,order_details',
+    select: 'id,clinic_code,patient_reference,service,status,created_at,responsible_lab,observations,order_details,test_number',
     order: 'created_at.desc,id.desc',
     limit: String(pageSize),
     offset: String(ordersOffset)
@@ -693,6 +760,7 @@ form.addEventListener('submit', async event => {
     if (!profile.ok) throw new Error('Profile unavailable');
     const rows = await profile.json();
     const role = rows.length === 1 ? roles.get(rows[0].role) : undefined;
+    isSuperAdmin = rows.length === 1 && rows[0].role === 'super_admin';
     if (!role) {
       form.hidden = true; logout.hidden = false; logout.disabled = true;
       status.textContent = 'Sesión iniciada.';
@@ -713,6 +781,7 @@ form.addEventListener('submit', async event => {
     await showOrders(rows[0].role).catch(() => { orderStatus.textContent = 'No se pudieron consultar las órdenes. Intenta iniciar sesión nuevamente.'; });
     if (rows[0].role === 'admin' || rows[0].role === 'super_admin') {
       await showPendingRequests().catch(() => { adminStatus.textContent = 'No se pudieron cargar las solicitudes.'; });
+      if (isSuperAdmin) await loadTestAccounts().catch(() => { testMessage.textContent = 'No se pudieron cargar las cuentas de prueba.'; });
     }
     if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
       try {
@@ -727,7 +796,7 @@ form.addEventListener('submit', async event => {
         document.head.append(stylesheet);
         try { await stylesReady; } catch (error) { stylesheet.remove(); throw error; }
         const unmount = mountWorkspace(workspace, {
-          label: role, canApprove: rows[0].role !== 'external',
+          label: rows[0].role === 'external' && registeredClinics.some(code => code.startsWith('PRUEBA-')) ? role + ' · Cuenta de prueba' : role, canApprove: rows[0].role !== 'external',
           orders: area, summary: savedSummary, requests: pendingAdmin, home: entrance.querySelector('main'),
           signOut: () => logout.click(), setLabFilter: setOrderLabFilter,
           getClinicOptions, subscribeClinics, setClinicFilter: setOrderClinicFilter,
@@ -770,6 +839,10 @@ logout.addEventListener('click', async () => {
   requestStatus.textContent = '';
   pendingAdmin.hidden = true;
   pendingList.replaceChildren();
+  isSuperAdmin = false;
+  testArea.hidden = true;
+  testList.replaceChildren();
+  testMessage.textContent = '';
   adminStatus.textContent = '';
   area.hidden = true;
   savedSummary.hidden = true;
