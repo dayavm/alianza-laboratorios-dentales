@@ -474,6 +474,148 @@ async function setPrice(id, amount) {
   }
 }
 
+const workStages = ['Aprobación','En proceso','Prueba','Nuevamente en proceso','Finalizado','Entregado'];
+const activityLabels = {
+  receive:'Recepción física', approve:'Recepción aprobada', move:'Cambio de estado', charge:'Cuenta de cobro creada',
+  report_payment:'Pago reportado', confirm_payment:'Pago confirmado', reject_payment:'Pago devuelto'
+};
+const orderMoney = new Intl.NumberFormat('es-CO', { style:'currency',currency:'COP',maximumFractionDigits:0 });
+let orderView = 'Órdenes';
+
+function selectOrderView(page) {
+  orderView = page;
+  ordersOffset = 0;
+  refreshOrderList();
+}
+
+function orderAction(order, action, caption, fields = []) {
+  const form = document.createElement('form');
+  form.className = 'order-lab-controls';
+  const inputs = {};
+  for (const [key, title, kind] of fields) {
+    const label = document.createElement('label');
+    label.textContent = title;
+    const input = document.createElement(Array.isArray(kind) ? 'select' : 'input');
+    if (Array.isArray(kind)) input.replaceChildren(...kind.map(value => new Option(value, value)));
+    else input.type = kind;
+    input.maxLength = key === 'p_note' ? 1000 : 200;
+    input.required = key !== 'p_note' || action === 'reject_payment';
+    label.append(input);
+    form.append(label);
+    inputs[key] = input;
+  }
+  const button = document.createElement('button');
+  button.type = 'submit';
+  button.textContent = caption;
+  const feedback = document.createElement('span');
+  feedback.setAttribute('role','status');
+  form.append(button, feedback);
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (button.disabled) return;
+    if (['confirm_payment','charge'].includes(action) && !window.confirm(caption + ' para esta orden?')) return;
+    button.disabled = true;
+    feedback.textContent = 'Guardando…';
+    try {
+      const values = Object.fromEntries(Object.entries(inputs).map(([key,input])=>[key,input.value.trim()]));
+      await requestData('rpc/lab_change_order',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({p_order:order.id,p_action:action,p_expected:order.status,...values})
+      });
+      orderStatus.textContent = ({
+        receive:'Recepción registrada. La orden sigue disponible en Órdenes y Recepción física.',
+        approve:'Recepción aprobada. La orden está disponible en Producción.',
+        move:'Estado de la orden actualizado.', charge:'Cuenta de cobro creada.',
+        report_payment:'Pago reportado. El laboratorio debe confirmarlo.', confirm_payment:'Pago confirmado.',
+        reject_payment:'Pago devuelto a la clínica para corrección.'
+      })[action];
+      await loadOrders();
+    } catch (error) {
+      feedback.textContent = error.code === '22023' ? error.databaseMessage : 'No se pudo completar el cambio. Actualiza la lista y vuelve a intentar.';
+      button.disabled = false;
+    }
+  });
+  return form;
+}
+
+function chargeDocument(order, charge) {
+  const documentView = document.implementation.createHTMLDocument('Cuenta de cobro');
+  const title = documentView.createElement('h1');
+  title.textContent = 'Cuenta de cobro';
+  documentView.body.append(title);
+  const issued = new Date(charge.created_at).toLocaleDateString('es-CO',{timeZone:'America/Bogota'});
+  for (const [label, value] of [
+    ['Referencia',charge.id],['Fecha de emisión',issued],['Laboratorio',laboratoryNames.get(order.responsible_lab)],
+    ['Clínica',order.clinic_code],['Orden',order.id],['Servicio',order.service],['Valor en COP',orderMoney.format(charge.amount)],
+    ['Estado de pago',charge.state]
+  ]) {
+    const line = documentView.createElement('p');
+    line.textContent = label + ': ' + value;
+    documentView.body.append(line);
+  }
+  const blob = new Blob(['<!doctype html>' + documentView.documentElement.outerHTML],{type:'text/html;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'cuenta-de-cobro-' + charge.id.slice(0,8) + '.html';
+  link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),30000);
+}
+
+function renderOperations(item, order) {
+  const charge = Array.isArray(order.lab_order_charges) ? order.lab_order_charges[0] : order.lab_order_charges;
+  if (charge) {
+    const summary = document.createElement('p');
+    summary.textContent = 'Cuenta de cobro ' + charge.id.slice(0,8).toUpperCase() + ' · ' +
+      orderMoney.format(charge.amount) + ' · ' + charge.state;
+    if (charge.payment_reference) summary.textContent += ' · Pago ' + charge.payment_date + ' · Ref. ' + charge.payment_reference;
+    const download = document.createElement('button');
+    download.type = 'button';
+    download.textContent = 'Descargar cuenta de cobro';
+    download.addEventListener('click',()=>chargeDocument(order,charge));
+    item.append(summary, download);
+  }
+  if (canAssignLab) {
+    if (['Orden realizada','Recepción'].includes(order.status)) {
+      item.append(orderAction(order,'receive','Registrar recepción',[
+        ['p_value','Elemento recibido y cantidad','text'],['p_note','Observaciones (opcional)','text']
+      ]));
+      if (order.status==='Recepción') item.append(orderAction(order,'approve','Aprobar recepción',[['p_note','Observaciones de aprobación (opcional)','text']]));
+    }
+    if (!charge && workStages.includes(order.status) && orderView!=='Finanzas') {
+      const targets = workStages.filter(status=>status!==order.status && (status!=='Entregado' || order.status==='Finalizado'));
+      item.append(orderAction(order,'move','Actualizar estado',[['p_value','Estado siguiente',targets],['p_note','Observaciones (opcional)','text']]));
+    }
+    if (!charge && order.status==='Entregado') {
+      if (order.order_details?.total != null && order.responsible_lab) item.append(orderAction(order,'charge','Crear cuenta de cobro'));
+      else {
+        const hint = document.createElement('p');
+        hint.textContent = 'Para crear la cuenta de cobro, asigna el laboratorio y verifica el valor de la orden.';
+        item.append(hint);
+      }
+    }
+    if (charge?.state==='Pago reportado') {
+      item.append(orderAction(order,'confirm_payment','Confirmar pago'));
+      item.append(orderAction(order,'reject_payment','Devolver reporte',[['p_note','Motivo de devolución','text']]));
+    }
+  } else if (charge?.state==='Pendiente de pago') {
+    item.append(orderAction(order,'report_payment','Reportar pago',[['p_paid_date','Fecha de pago','date'],['p_value','Referencia de pago','text']]));
+  }
+  if (order.lab_order_activity?.length) {
+    const history = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = 'Historial de la orden';
+    history.append(summary);
+    for (const event of [...order.lab_order_activity].sort((a,b)=>b.id-a.id)) {
+      const row = document.createElement('p');
+      const time = new Date(event.created_at).toLocaleString('es-CO',{ timeZone:'America/Bogota' });
+      row.textContent = [time, activityLabels[event.action], event.previous_status!==event.order_status ? event.order_status : '', event.note].filter(Boolean).join(' · ');
+      history.append(row);
+    }
+    item.append(history);
+  }
+}
+
 function renderOrder(order) {
   const item = document.createElement('li');
   const time = new Intl.DateTimeFormat('es-CO', { dateStyle: 'short', timeStyle: 'short', timeZone: 'America/Bogota' }).format(new Date(order.created_at));
@@ -510,7 +652,7 @@ function renderOrder(order) {
     item.append(expanded);
   }
 
-  if (canAssignLab) {
+  if (canAssignLab && !order.lab_order_charges?.id && !order.lab_order_charges?.length) {
     const controls = document.createElement('div');
     controls.className = 'order-lab-controls';
     const label = document.createElement('label');
@@ -560,6 +702,7 @@ function renderOrder(order) {
       }
     });
   }
+  renderOperations(item, order);
   return item;
 }
 
@@ -567,11 +710,14 @@ async function loadOrders() {
   const requestVersion = ++orderLoadVersion;
   const filter = orderLabFilter.value;
   const query = new URLSearchParams({
-    select: 'id,clinic_code,patient_reference,service,status,created_at,responsible_lab,observations,order_details',
+    select: 'id,clinic_code,patient_reference,service,status,created_at,responsible_lab,observations,order_details,lab_order_charges(id,amount,state,created_at,payment_date,payment_reference),lab_order_activity(id,action,previous_status,order_status,note,created_at)',
     order: 'created_at.desc,id.desc',
     limit: String(pageSize),
     offset: String(ordersOffset)
   });
+  if (orderView==='Recepción física') query.set('status','in.("Orden realizada","Recepción")');
+  if (orderView==='Producción') query.set('status','in.(' + workStages.map(value=>JSON.stringify(value)).join(',') + ')');
+  if (orderView==='Finanzas') query.set('status','eq.Entregado');
   if (filter) query.set('responsible_lab', filter === 'unassigned' ? 'is.null' : 'eq.' + filter);
   if (selectedClinics.length) query.set('clinic_code', 'in.(' + selectedClinics.map(code => JSON.stringify(code)).join(',') + ')');
   try {
@@ -716,10 +862,10 @@ form.addEventListener('submit', async event => {
     }
     if (['super_admin', 'admin', 'external'].includes(rows[0].role)) {
       try {
-        const { mountWorkspace } = await import('./workspace.js?v=formulario-orden');
+        const { mountWorkspace } = await import('./workspace.js?v=recepcion-cobros');
         const stylesheet = document.createElement('link');
         stylesheet.rel = 'stylesheet';
-        stylesheet.href = './workspace.css?v=formulario-orden';
+        stylesheet.href = './workspace.css?v=recepcion-cobros';
         const stylesReady = new Promise((resolve, reject) => {
           stylesheet.onload = resolve;
           stylesheet.onerror = reject;
@@ -731,7 +877,7 @@ form.addEventListener('submit', async event => {
           orders: area, summary: savedSummary, requests: pendingAdmin, home: entrance.querySelector('main'),
           signOut: () => logout.click(), setLabFilter: setOrderLabFilter,
           getClinicOptions, subscribeClinics, setClinicFilter: setOrderClinicFilter,
-          getCatalog: () => catalogEntries, addService, setPrice, getOrderClinics, getDoctors, findPatient, createOrder
+          getCatalog: () => catalogEntries, addService, setPrice, getOrderClinics, getDoctors, findPatient, createOrder, selectOrderView
         });
         unmountWorkspace = () => { unmount(); stylesheet.remove(); };
         orderLabFilter.hidden = true;
@@ -777,6 +923,7 @@ logout.addEventListener('click', async () => {
   ordersOffset = 0;
   ++orderLoadVersion;
   orderLabFilter.value = '';
+  orderView = 'Órdenes';
   registeredClinics = [];
   selectedClinics = [];
   pendingRequests = [];
